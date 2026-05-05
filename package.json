@@ -1,0 +1,40 @@
+{
+  "name": "@perryts/tursodb",
+  "version": "0.1.0",
+  "description": "Tursodb (pure-Rust SQLite-compatible engine) bindings for the Perry TypeScript-to-native compiler.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PerryTS/tursodb-bindings.git"
+  },
+  "homepage": "https://github.com/PerryTS/tursodb-bindings#readme",
+  "bugs": {
+    "url": "https://github.com/PerryTS/perry/issues"
+  },
+  "keywords": ["perry", "perryts", "tursodb", "turso", "sqlite", "database"],
+  "files": [
+    "src/",
+    "Cargo.toml",
+    "README.md"
+  ],
+  "perry": {
+    "nativeLibrary": {
+      "abiVersion": "0.5",
+      "functions": [
+        { "name": "js_turso_open",               "params": ["string"],               "returns": "promise" },
+        { "name": "js_turso_exec",               "params": ["i64", "string"],        "returns": "promise" },
+        { "name": "js_turso_exec_batch",         "params": ["i64", "string"],        "returns": "promise" },
+        { "name": "js_turso_query_all",          "params": ["i64", "string"],        "returns": "promise" },
+        { "name": "js_turso_query_one",          "params": ["i64", "string"],        "returns": "promise" },
+        { "name": "js_turso_last_insert_rowid",  "params": ["i64"],                  "returns": "f64"     },
+        { "name": "js_turso_is_autocommit",      "params": ["i64"],                  "returns": "f64"     },
+        { "name": "js_turso_close",              "params": ["i64"],                  "returns": "f64"     }
+      ],
+      "targets": {
+        "macos":   { "cargo_features": [], "frameworks": [] },
+        "linux":   { "cargo_features": [] },
+        "windows": { "cargo_features": [] }
+      }
+    }
+  }
+}
