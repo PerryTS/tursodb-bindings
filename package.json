@@ -1,6 +1,6 @@
 {
   "name": "@perryts/tursodb",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Tursodb (pure-Rust SQLite-compatible engine) bindings for the Perry TypeScript-to-native compiler.",
   "license": "MIT",
   "repository": {
