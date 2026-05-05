@@ -115,6 +115,42 @@ const alice = await tursodb.queryOne(db, "SELECT * FROM users WHERE name = 'Alic
 console.log(alice?.email);
 ```
 
+### Parameterized variants — `execWith` / `queryAllWith` / `queryOneWith` (v0.2.0)
+
+Use `?` placeholders in the SQL and bind from a `params` array. **Use these whenever any value comes from untrusted input** — the unparameterized variants only accept static SQL.
+
+```typescript
+function execWith(db: Database, sql: string, params: Param[]): Promise<number>;
+function queryAllWith(db: Database, sql: string, params: Param[]): Promise<Row[]>;
+function queryOneWith(db: Database, sql: string, params: Param[]): Promise<Row | null>;
+
+// `Param` types: string | number | boolean | null | number[] (Uint8 → Blob)
+type Param = string | number | boolean | null | number[];
+```
+
+```typescript
+const rows = await tursodb.execWith(
+  db,
+  "INSERT INTO users (name, email, age) VALUES (?, ?, ?)",
+  ["Eve", "eve@example.com", 31],
+);
+
+const user = await tursodb.queryOneWith(
+  db,
+  "SELECT * FROM users WHERE email = ? AND active = ?",
+  ["eve@example.com", true],
+);
+
+// Blob: pass a Uint8Array as a number[] (each element 0..=255)
+await tursodb.execWith(
+  db,
+  "INSERT INTO files (sha256, body) VALUES (?, ?)",
+  ["abc123", [0x89, 0x50, 0x4e, 0x47]],  // PNG header
+);
+```
+
+Object params (e.g. `{ foo: "bar" }`) are rejected at runtime since SQLite has no native JSON column type — `JSON.stringify` first if you want to store a structured value.
+
 ### `lastInsertRowid(db)`
 
 ```typescript

@@ -29,8 +29,8 @@
 
 use perry_ffi::{
     alloc_string, build_object_shape, drop_handle, get_handle, js_array_alloc, js_array_push,
-    js_object_alloc_with_shape, js_object_set_field, read_string, register_handle, spawn_blocking,
-    with_handle, Handle, JsPromise, JsString, JsValue, Promise, StringHeader,
+    js_object_alloc_with_shape, js_object_set_field, json_stringify, read_string, register_handle,
+    spawn_blocking, with_handle, Handle, JsPromise, JsString, JsValue, Promise, StringHeader,
 };
 use turso::{Builder, Connection};
 
@@ -324,16 +324,262 @@ pub unsafe extern "C" fn js_turso_query_one(
     raw
 }
 
+// ── Param-binding helpers (v0.2.0) ────────────────────────────────────
+//
+// JS-side passes a parameter array as a NaN-boxed JsValue (f64 at the
+// FFI boundary). We JSON-stringify it via `perry_ffi::json_stringify`,
+// parse to `serde_json::Value`, and convert each element to a
+// `turso::Value`. Same recipe perry-ext-mongodb's `*_value` variants
+// use to bridge codegen's NA_F64 coercion onto a typed Rust API.
+//
+// Supported element types: null, boolean (→ Integer 0/1), integer,
+// float, string, array of bytes (→ Blob). Nested objects are rejected
+// with a clear error since SQLite has no JSON type natively.
+
+fn json_to_turso_value(v: &serde_json::Value) -> Result<turso::Value, String> {
+    match v {
+        serde_json::Value::Null => Ok(turso::Value::Null),
+        serde_json::Value::Bool(b) => Ok(turso::Value::Integer(if *b { 1 } else { 0 })),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(turso::Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(turso::Value::Real(f))
+            } else {
+                Err(format!("unrepresentable number param: {}", n))
+            }
+        }
+        serde_json::Value::String(s) => Ok(turso::Value::Text(s.clone())),
+        serde_json::Value::Array(items) => {
+            // Heuristic: array-of-numbers in [0, 255] → Blob. Any other
+            // shape is rejected; users should pre-convert.
+            let mut bytes = Vec::with_capacity(items.len());
+            for it in items {
+                match it.as_u64() {
+                    Some(n) if n <= 255 => bytes.push(n as u8),
+                    _ => return Err("array param must be Uint8-byte sequence".to_string()),
+                }
+            }
+            Ok(turso::Value::Blob(bytes))
+        }
+        serde_json::Value::Object(_) => Err("object params unsupported (no SQLite JSON type)".into()),
+    }
+}
+
+fn parse_params(params_value: f64) -> Result<Vec<turso::Value>, String> {
+    let jv = JsValue::from_bits(params_value.to_bits());
+    if jv.is_undefined() || jv.is_null() {
+        return Ok(Vec::new());
+    }
+    let json = json_stringify(jv).ok_or_else(|| "params: json_stringify returned None".to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("params: invalid JSON ({})", e))?;
+    let arr = match parsed {
+        serde_json::Value::Array(a) => a,
+        _ => return Err("params must be an array".into()),
+    };
+    arr.iter().map(json_to_turso_value).collect()
+}
+
+/// `tursodb.execWith(handle, sql, params) -> Promise<number>` —
+/// execute a non-query statement with `?` placeholders bound from the
+/// `params` array. Resolves with rows affected.
+///
+/// # Safety
+///
+/// `sql_ptr` must be null or a Perry-runtime `StringHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_turso_exec_with(
+    db_handle: Handle,
+    sql_ptr: *const StringHeader,
+    params_value: f64,
+) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+    let Some(sql) = read_str(sql_ptr) else {
+        promise.reject_string("Invalid SQL string");
+        return raw;
+    };
+    let params = match parse_params(params_value) {
+        Ok(p) => p,
+        Err(e) => {
+            promise.reject_string(&format!("tursodb execWith: {}", e));
+            return raw;
+        }
+    };
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<TursoConn, _, _>(db_handle, |h| {
+            tokio::runtime::Handle::current().block_on(async {
+                h.conn.execute(&sql, params).await
+            })
+        });
+        match outcome {
+            Some(Ok(rows_affected)) => {
+                promise.resolve(JsValue::from_number(rows_affected as f64));
+            }
+            Some(Err(e)) => promise.reject_string(&format!("tursodb execWith: {}", e)),
+            None => promise.reject_string("tursodb: invalid handle"),
+        }
+    });
+    raw
+}
+
+/// `tursodb.queryAllWith(handle, sql, params) -> Promise<Array<Object>>`.
+///
+/// # Safety
+///
+/// `sql_ptr` must be null or a Perry-runtime `StringHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_turso_query_all_with(
+    db_handle: Handle,
+    sql_ptr: *const StringHeader,
+    params_value: f64,
+) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+    let Some(sql) = read_str(sql_ptr) else {
+        promise.reject_string("Invalid SQL string");
+        return raw;
+    };
+    let params = match parse_params(params_value) {
+        Ok(p) => p,
+        Err(e) => {
+            promise.reject_string(&format!("tursodb queryAllWith: {}", e));
+            return raw;
+        }
+    };
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<TursoConn, _, _>(db_handle, |h| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut stmt = h.conn.prepare(&sql).await?;
+                let column_names: Vec<String> =
+                    stmt.columns().iter().map(|c| c.name().to_string()).collect();
+                let mut rows = stmt.query(params).await?;
+                let mut objects: Vec<JsValue> = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    objects.push(row_to_object(&row, &column_names));
+                }
+                Ok::<Vec<JsValue>, turso::Error>(objects)
+            })
+        });
+        match outcome {
+            Some(Ok(objects)) => {
+                let mut arr = js_array_alloc(objects.len() as u32);
+                for obj in objects {
+                    arr = js_array_push(arr, obj);
+                }
+                promise.resolve(JsValue::from_object_ptr(arr));
+            }
+            Some(Err(e)) => promise.reject_string(&format!("tursodb queryAllWith: {}", e)),
+            None => promise.reject_string("tursodb: invalid handle"),
+        }
+    });
+    raw
+}
+
+/// `tursodb.queryOneWith(handle, sql, params) -> Promise<Object | null>`.
+///
+/// # Safety
+///
+/// `sql_ptr` must be null or a Perry-runtime `StringHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_turso_query_one_with(
+    db_handle: Handle,
+    sql_ptr: *const StringHeader,
+    params_value: f64,
+) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+    let Some(sql) = read_str(sql_ptr) else {
+        promise.reject_string("Invalid SQL string");
+        return raw;
+    };
+    let params = match parse_params(params_value) {
+        Ok(p) => p,
+        Err(e) => {
+            promise.reject_string(&format!("tursodb queryOneWith: {}", e));
+            return raw;
+        }
+    };
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<TursoConn, _, _>(db_handle, |h| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut stmt = h.conn.prepare(&sql).await?;
+                let column_names: Vec<String> =
+                    stmt.columns().iter().map(|c| c.name().to_string()).collect();
+                let mut rows = stmt.query(params).await?;
+                let first = rows.next().await?;
+                Ok::<Option<JsValue>, turso::Error>(
+                    first.map(|row| row_to_object(&row, &column_names)),
+                )
+            })
+        });
+        match outcome {
+            Some(Ok(Some(obj))) => promise.resolve(obj),
+            Some(Ok(None)) => promise.resolve(JsValue::NULL),
+            Some(Err(e)) => promise.reject_string(&format!("tursodb queryOneWith: {}", e)),
+            None => promise.reject_string("tursodb: invalid handle"),
+        }
+    });
+    raw
+}
+
 #[cfg(test)]
 mod tests {
-    // Unit tests for tursodb need a tokio runtime — perry-ffi's
-    // spawn_blocking pumps the global runtime which is owned by
-    // perry-stdlib's async_bridge. That static isn't initialized
-    // in standalone unit tests (no perry-stdlib link). End-to-end
-    // smoke testing happens via the TS integration in release
-    // mode, where the full link surface is in place.
-    //
-    // The pure-Rust correctness of the underlying turso crate is
-    // covered by upstream tests; our wrapper just plumbs args
-    // and resolutions, exercised end-to-end.
+    use super::*;
+
+    #[test]
+    fn json_to_turso_value_primitives() {
+        assert!(matches!(
+            json_to_turso_value(&serde_json::Value::Null).unwrap(),
+            turso::Value::Null
+        ));
+        assert!(matches!(
+            json_to_turso_value(&serde_json::Value::Bool(true)).unwrap(),
+            turso::Value::Integer(1)
+        ));
+        assert!(matches!(
+            json_to_turso_value(&serde_json::json!(42)).unwrap(),
+            turso::Value::Integer(42)
+        ));
+        assert!(matches!(
+            json_to_turso_value(&serde_json::json!(3.14)).unwrap(),
+            turso::Value::Real(_)
+        ));
+        if let turso::Value::Text(s) = json_to_turso_value(&serde_json::json!("hi")).unwrap() {
+            assert_eq!(s, "hi");
+        } else {
+            panic!("expected Text");
+        }
+    }
+
+    #[test]
+    fn json_array_of_bytes_becomes_blob() {
+        let v = serde_json::json!([0, 255, 16]);
+        if let turso::Value::Blob(b) = json_to_turso_value(&v).unwrap() {
+            assert_eq!(b, vec![0u8, 255, 16]);
+        } else {
+            panic!("expected Blob");
+        }
+    }
+
+    #[test]
+    fn json_array_with_non_byte_rejects() {
+        let v = serde_json::json!([1, "two"]);
+        assert!(json_to_turso_value(&v).is_err());
+    }
+
+    #[test]
+    fn json_object_rejects() {
+        let v = serde_json::json!({ "k": "v" });
+        assert!(json_to_turso_value(&v).is_err());
+    }
+
+    // Unit tests for the FFI exports themselves need a tokio runtime —
+    // perry-ffi's spawn_blocking pumps the global runtime which is
+    // owned by perry-stdlib's async_bridge. End-to-end smoke testing
+    // happens via TS integration in release mode.
 }
